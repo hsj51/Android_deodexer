@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+
+# Make temp work dir
+TMPDIR=$(pwd)/tmp
+mkdir -p  $TMPDIR
+mkdir -p $TMPDIR/dexout
+
+if [ "$#" -lt 1 ]; then
+    echo "You have to specify at least one app to deodex"
+    exit 1
+fi
+
+# REQUIREMENT: cd into $ROM_DUMP/system
+if [[ ! -d framework ]]; then
+    echo -e "${lightred}Please make sure to cd into \$ROM_DUMP/system first.${nc}"
+    exit 1
+fi
+
+if [[ $1 == "--all" || $1 == "-a" ]]; then
+    modules=$(find . \( -iname '*.jar' -o -iname '*.apk' \) | sort)
+    SKIPBACKUP=true
+else
+    modules="$@"
+fi
+
+# Detect arch
+if [ -d framework/arm64 ]; then
+    device_arch=arm64
+else
+    device_arch=arm
+fi
+
+# Process
+BOOTOAT=$(readlink -f framework/$device_arch/boot.oat)
+for module in $modules; do
+    FPATH=$(readlink -f $module)
+    FILE=$(basename "$FPATH")
+    FNAME=$(echo "$FILE" | sed -e 's/\.[^.]*$//')
+    if [[ -z $(unzip -l $FPATH | grep classes.dex) ]]; then
+        # Detect apk or jar
+        if [[ $module = *.apk ]]; then
+            APPDIR=$(find * -type d -name "$FNAME")
+            if ls $APPDIR/oat/$device_arch/$FNAME* 1> /dev/null 2>&1; then
+                OAT=$(readlink -f $APPDIR/oat/$device_arch)
+            else
+                echo -e "${lightred}Error: Couldn't find .odex or .vdex for following app: $FILE"
+                continue
+            fi
+        elif [[ $module = *.jar ]]; then
+            if ls framework/oat/$device_arch/$FNAME* 1> /dev/null 2>&1; then
+                OAT=$(readlink -f framework/oat/$device_arch)
+                BOOTJAR="false"
+            elif ls framework/boot-$FNAME* 1> /dev/null 2>&1; then
+                echo -e "${darkgray}Boot jar detected...${nc}"
+                BOOTJAR="true"
+            else
+                echo -e "${lightred}Error: Couldn't find .odex or .vdex for following jar: $FILE"
+                continue
+            fi
+        fi
+        DEX=$(readlink -f $OAT/$FNAME.odex)
+        VDEX=$(readlink -f $OAT/$FNAME.vdex)
+        if [[ $BOOTJAR == "true" ]]; then
+            VDEX=$(readlink -f framework/boot-$FNAME.vdex)
+            FNAME="boot-${FNAME}"
+        fi
+
+        # Make backup
+        if [[ ! $SKIPBACKUP ]]; then
+            cp $FPATH ${FPATH}.oldbak
+        fi
+
+        if [[ -f $VDEX ]]; then
+            echo -e "${lightcyan}Deodexing using vdexExtractor${nc}"
+            # Use vdexExtractor for .dex if .vdex is present
+            "$VVDEXEXTRACTOR" -o "$TMPDIR" -i $VDEX &> /dev/null
+            if [[ -f $(readlink -f "$TMPDIR/${FNAME}_classes.cdex") ]]; then
+                "$CCDEXCONVERTER" "$TMPDIR/${FNAME}_classes.cdex" &> /dev/null
+                mv "$TMPDIR/${FNAME}_classes.cdex.new" "$TMPDIR/classes.dex"
+            else
+                mv "$TMPDIR/${FNAME}_classes.dex" "$TMPDIR/classes.dex"
+            fi
+        else
+            echo -e "${lightcyan}Deodexing using smali/baksmali${nc}"
+            # Use baksmali/smali for dex
+            java -jar "$BBAKSMALIJAR" deodex -o "$TMPDIR/dexout" -b "$BOOTOAT" -d "$OAT" "$DEX"
+            java -jar "$SSMALIJAR" assemble "$TMPDIR/dexout" -o "$TMPDIR/classes.dex"
+            rm -rf $TMPDIR/dexout/*
+        fi
+
+        # Pack deodexed module
+        zip -gjq $FPATH $TMPDIR/classes.dex
+
+        # Cleanup
+        rm $TMPDIR/classes.dex
+
+        echo -e "${lightgreen}Deodexed: $FPATH${nc}"
+    else
+        echo -e "${lightblue} $FPATH already deodexed${nc}"
+    fi
+done
+
+rm -rf $TMPDIR
